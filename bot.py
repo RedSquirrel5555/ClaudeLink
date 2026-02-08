@@ -26,7 +26,7 @@ MSG_LIMIT = 4000
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO
 )
-log = logging.getLogger("clawd")
+log = logging.getLogger("claudelink")
 
 # --- Session ---
 
@@ -64,6 +64,7 @@ def _run_claude(prompt: str, sid: str | None) -> subprocess.CompletedProcess:
         "claude", "-p", prompt,
         "--output-format", "json",
         "--model", MODEL,
+        "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task",
     ]
     if sid:
         cmd += ["--resume", sid]
@@ -121,7 +122,7 @@ async def ask_claude(prompt: str) -> str:
 
 @owner_only
 async def cmd_start(update: Update, context):
-    await update.message.reply_text("Clawd online. Send me anything.")
+    await update.message.reply_text("ClaudeLink online. Send me anything.")
 
 @owner_only
 async def cmd_clear(update: Update, context):
@@ -145,8 +146,15 @@ async def handle_message(update: Update, context):
     if not text:
         return
 
-    await update.message.chat.send_action("typing")
-    log.info("Message from Red: %s", text[:80])
+    log.info("Message from owner: %s", text[:80])
+
+    # Keep "typing..." active while Claude works
+    typing = True
+    async def keep_typing():
+        while typing:
+            await update.message.chat.send_action("typing")
+            await asyncio.sleep(4)
+    typing_task = asyncio.create_task(keep_typing())
 
     try:
         response = await ask_claude(text)
@@ -155,6 +163,9 @@ async def handle_message(update: Update, context):
     except Exception as e:
         log.exception("Claude invocation failed")
         response = f"Error: {e}"
+    finally:
+        typing = False
+        typing_task.cancel()
 
     msg_count += 1
 
@@ -169,7 +180,7 @@ async def handle_message(update: Update, context):
 
 def main():
     sid = session_id[:8] + "..." if session_id else "new"
-    log.info("Starting Clawd (session: %s)", sid)
+    log.info("Starting ClaudeLink (session: %s)", sid)
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("clear", cmd_clear))
