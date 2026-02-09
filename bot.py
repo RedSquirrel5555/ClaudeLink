@@ -89,7 +89,10 @@ def owner_only(func):
 def _read_stdout(proc, queue):
     """Read NDJSON lines from proc stdout into queue. Runs in a thread."""
     try:
-        for raw_line in proc.stdout:
+        while True:
+            raw_line = proc.stdout.readline()
+            if not raw_line:
+                break  # EOF
             line = raw_line.decode("utf-8", errors="replace").strip()
             if not line:
                 continue
