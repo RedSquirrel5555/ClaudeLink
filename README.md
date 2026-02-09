@@ -5,9 +5,23 @@ A Telegram bot that bridges your messages to [Claude Code](https://docs.anthropi
 ## How it works
 
 1. You send a message in Telegram
-2. The bot runs `claude -p "your message"` on your machine
-3. Claude's response is sent back to you in Telegram
-4. Sessions persist across messages via `--resume`, so Claude has full conversation context
+2. The bot sends a "Working..." status message and spawns `claude -p` with streaming output
+3. As Claude uses tools (reading files, running commands, searching the web), the status message updates in real-time so you can see what's happening
+4. When Claude finishes, the status message is removed and the final response is sent
+5. Sessions persist across messages via `--resume`, so Claude has full conversation context
+
+### Live streaming progress
+
+While Claude works, you'll see a live status message that updates as tools are used:
+
+```
+Reading src/auth.ts
+Searching code for "validateToken"
+Running command
+Editing src/auth.ts
+```
+
+Status updates are throttled to respect Telegram's rate limits (max 1 edit per 3 seconds).
 
 ## Prerequisites
 
@@ -67,6 +81,24 @@ ClaudeLink looks for a `CLAUDE.md` file in the workspace directory. Claude Code 
 - `USER.md` — context about you
 
 These are optional. Without them, Claude responds with its default personality.
+
+## Architecture
+
+```
+Telegram  ←→  bot.py  ←→  claude CLI (subprocess)
+                │
+                ├── Popen with --output-format stream-json --verbose
+                ├── NDJSON lines read in background thread
+                ├── tool_use events → live status message edits
+                └── result event → final response sent to chat
+```
+
+Key implementation details:
+- Uses `subprocess.Popen` (not `subprocess.run`) for streaming output
+- Stdout is read line-by-line in a daemon thread, parsed as NDJSON
+- An `asyncio.Queue` bridges the reader thread to the async event loop
+- `CREATE_NO_WINDOW` flag on Windows prevents console popups
+- `stdin=DEVNULL` prevents the subprocess from hanging on input
 
 ## Security
 
