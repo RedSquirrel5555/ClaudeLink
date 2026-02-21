@@ -23,6 +23,16 @@ Editing src/auth.ts
 
 Status updates are throttled to respect Telegram's rate limits (max 1 edit per 3 seconds).
 
+### File and image sharing
+
+Files and images can be shared in both directions through Telegram:
+
+**Telegram → Claude:** Send a photo or document in the chat. The bot downloads it to a local `downloads/` directory and tells Claude to read it. Works with images (screenshots, diagrams), code files, configs — anything you'd want Claude to look at.
+
+**Claude → Telegram:** When Claude creates or writes files during a session, they're automatically sent back to you. Images (`.png`, `.jpg`, `.gif`, `.webp`, `.svg`) are sent as photos; everything else is sent as a document. This lets you receive generated code, exports, or any file Claude produces.
+
+Downloaded files are cleaned up when you run `/clear`.
+
 ## Prerequisites
 
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
@@ -90,7 +100,9 @@ Telegram  ←→  bot.py  ←→  claude CLI (subprocess)
                 ├── Popen with --output-format stream-json --verbose
                 ├── NDJSON lines read in background thread
                 ├── tool_use events → live status message edits
-                └── result event → final response sent to chat
+                ├── Write tool events → track created files
+                ├── result event → final response sent to chat
+                └── created files → sent back as photos/documents
 ```
 
 Key implementation details:
@@ -99,6 +111,8 @@ Key implementation details:
 - An `asyncio.Queue` bridges the reader thread to the async event loop
 - `CREATE_NO_WINDOW` flag on Windows prevents console popups
 - `stdin=DEVNULL` prevents the subprocess from hanging on input
+- Telegram photos/documents are downloaded to `downloads/` and passed to Claude via prompt
+- Files Claude writes are tracked during streaming and sent back to Telegram after the response
 
 ## Security
 
