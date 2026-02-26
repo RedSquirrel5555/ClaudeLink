@@ -1,0 +1,7 @@
+{
+  "name": "claudelink-bridge",
+  "private": true,
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "latest"
+  }
+}

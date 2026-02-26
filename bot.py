@@ -25,6 +25,7 @@ WORKSPACE = os.getenv("WORKSPACE_DIR", ".")
 TIMEOUT = int(os.getenv("COMMAND_TIMEOUT", "600"))
 
 SESSION_FILE = Path(__file__).parent / ".session"
+BRIDGE_SCRIPT = Path(__file__).parent / "bridge.mjs"
 DOWNLOADS_DIR = Path(__file__).parent / "downloads"
 MSG_LIMIT = 4000
 STATUS_THROTTLE = 3  # min seconds between Telegram status edits
@@ -140,37 +141,35 @@ async def _edit_status(msg, tool_log: list[str]):
 
 
 async def stream_claude(prompt: str, status_msg) -> tuple[str, list[str]]:
-    """Spawn claude with stream-json, update status_msg live, return (text, written_files)."""
+    """Spawn bridge.mjs via Node, stream SDK events, update status_msg live, return (text, written_files)."""
     global session_id
 
-    cmd = [
-        "claude", "-p", prompt,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--model", MODEL,
-        "--allowedTools", "Bash,Read,Write,Edit,Glob,Grep,WebFetch,WebSearch,Task",
-    ]
-    if session_id:
-        cmd += ["--resume", session_id]
+    cmd = ["node", str(BRIDGE_SCRIPT)]
 
     popen_kwargs = {}
     if sys.platform == "win32":
         popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
-    # Strip CLAUDECODE env var to avoid "nested session" detection
     env = {k: v for k, v in os.environ.items() if k != "CLAUDECODE"}
+    if session_id:
+        env["BRIDGE_SESSION_ID"] = session_id
+    env["BRIDGE_MODEL"] = MODEL
 
-    log.info("Spawning claude (session=%s)", session_id[:8] if session_id else "new")
+    log.info("Spawning bridge (session=%s)", session_id[:8] if session_id else "new")
 
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         cwd=WORKSPACE,
         env=env,
         **popen_kwargs,
     )
+
+    # Send prompt via stdin then close so the bridge can start
+    proc.stdin.write(prompt.encode("utf-8"))
+    proc.stdin.close()
 
     q = stdlib_queue.Queue()
     reader = threading.Thread(target=_read_stdout, args=(proc, q), daemon=True)
@@ -217,19 +216,20 @@ async def stream_claude(prompt: str, status_msg) -> tuple[str, list[str]]:
             continue
 
         # --- Extract tool_use from assistant messages ---
-        msg = event.get("message", event)
-        content = msg.get("content") if isinstance(msg, dict) else None
-        if isinstance(content, list):
-            for block in content:
-                if isinstance(block, dict) and block.get("type") == "tool_use":
-                    tool_name = block.get("name", "?")
-                    tool_input = block.get("input", {})
-                    desc = _describe_tool(tool_name, tool_input)
-                    tool_log.append(desc)
-                    pending_update = True
-                    log.info("Tool: %s", desc)
-                    if tool_name == "Write" and tool_input.get("file_path"):
-                        written_files.append(tool_input["file_path"])
+        if event.get("type") == "assistant":
+            msg_data = event.get("message", {})
+            content = msg_data.get("content", [])
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_name = block.get("name", "?")
+                        tool_input = block.get("input", {})
+                        desc = _describe_tool(tool_name, tool_input)
+                        tool_log.append(desc)
+                        pending_update = True
+                        log.info("Tool: %s", desc)
+                        if tool_name == "Write" and tool_input.get("file_path"):
+                            written_files.append(tool_input["file_path"])
 
         # Save session_id from any event that carries it
         sid = event.get("session_id")
@@ -251,11 +251,11 @@ async def stream_claude(prompt: str, status_msg) -> tuple[str, list[str]]:
 
     stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
 
-    log.info("claude exited %d, stderr=%d bytes, tools=%d",
+    log.info("bridge exited %d, stderr=%d bytes, tools=%d",
              proc.returncode, len(stderr), len(tool_log))
 
     if proc.returncode != 0 and not result_text:
-        log.error("claude error: %s", stderr)
+        log.error("bridge error: %s", stderr)
         return f"Error (exit {proc.returncode}): {stderr}", written_files
 
     if result_text is None:
