@@ -1,18 +1,19 @@
 # ClaudeLink
 
-A Telegram bot that bridges your messages to [Claude Code](https://docs.anthropic.com/en/docs/claude-code) CLI. Chat with Claude from your phone — with full access to your machine's tools and filesystem.
+A Telegram bot that bridges your messages to Claude — with full tool access to your machine's filesystem and shell. Chat with Claude from your phone.
 
 ## How it works
 
 1. You send a message in Telegram
-2. The bot sends a "Working..." status message and spawns `claude -p` with streaming output
-3. As Claude uses tools (reading files, running commands, searching the web), the status message updates in real-time so you can see what's happening
-4. When Claude finishes, the status message is removed and the final response is sent
-5. Sessions persist across messages via `--resume`, so Claude has full conversation context
+2. The bot calls the Anthropic API directly using your Claude subscription's OAuth token
+3. Claude can use tools (Read, Write, Edit, Bash, Glob, Grep, WebFetch) — executed locally by the bot
+4. As Claude works, the status message updates in real-time showing tool activity and a response preview
+5. When Claude finishes, the final response is sent and any written files are shared back
+6. Conversation history persists across messages
 
 ### Live streaming progress
 
-While Claude works, you'll see a live status message that updates as tools are used:
+While Claude works, you'll see a live status message showing tools being used and a preview of the response:
 
 ```
 Reading src/auth.ts
@@ -21,22 +22,16 @@ Running command
 Editing src/auth.ts
 ```
 
-Status updates are throttled to respect Telegram's rate limits (max 1 edit per 3 seconds).
-
 ### File and image sharing
 
-Files and images can be shared in both directions through Telegram:
+**Telegram → Claude:** Send a photo or document in the chat. Images are sent to the API as vision content. Other files are read and included as text.
 
-**Telegram → Claude:** Send a photo or document in the chat. The bot downloads it to a local `downloads/` directory and tells Claude to read it. Works with images (screenshots, diagrams), code files, configs — anything you'd want Claude to look at.
-
-**Claude → Telegram:** When Claude creates or writes files during a session, they're automatically sent back to you. Images (`.png`, `.jpg`, `.gif`, `.webp`, `.svg`) are sent as photos; everything else is sent as a document. This lets you receive generated code, exports, or any file Claude produces.
-
-Downloaded files are cleaned up when you run `/clear`.
+**Claude → Telegram:** When Claude writes files using the Write tool, they're automatically sent back to you. Images are sent as photos; everything else as documents.
 
 ## Prerequisites
 
-- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed and authenticated
 - Python 3.10+
+- A Claude subscription (Pro/Max) with Claude Code authenticated (`claude login`)
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Your Telegram user ID (from [@userinfobot](https://t.me/userinfobot))
 
@@ -79,13 +74,30 @@ pm2 save
 | Command   | Description                          |
 |-----------|--------------------------------------|
 | `/start`  | Confirm the bot is online            |
-| `/clear`  | Reset the session (new conversation) |
-| `/status` | Show session ID, message count, model|
+| `/clear`  | Reset conversation and history       |
+| `/status` | Show message count, history size, model |
+
+## Tools
+
+Claude has access to these tools, executed locally by the bot:
+
+| Tool       | Description                              |
+|------------|------------------------------------------|
+| `Bash`     | Run shell commands (via Git Bash on Windows) |
+| `Read`     | Read files with line numbers             |
+| `Write`    | Create or overwrite files                |
+| `Edit`     | Find-and-replace in files                |
+| `Glob`     | Find files by glob pattern               |
+| `Grep`     | Search file contents with regex          |
+| `WebFetch` | Fetch content from URLs                  |
+
+The agentic loop supports up to 25 tool turns per message.
 
 ## Personality (optional)
 
-ClaudeLink looks for a `CLAUDE.md` file in the workspace directory. Claude Code reads this automatically and uses it as a system prompt. You can also add personality files referenced from `CLAUDE.md`:
+The bot builds a system prompt from personality files in the project directory:
 
+- `CLAUDE.md` — base instructions
 - `SOUL.md` — personality and style
 - `IDENTITY.md` — name and identity
 - `USER.md` — context about you
@@ -95,29 +107,29 @@ These are optional. Without them, Claude responds with its default personality.
 ## Architecture
 
 ```
-Telegram  ←→  bot.py  ←→  claude CLI (subprocess)
+Telegram  ←→  bot.py  ←→  Anthropic API (direct HTTP)
                 │
-                ├── Popen with --output-format stream-json --verbose
-                ├── NDJSON lines read in background thread
-                ├── tool_use events → live status message edits
-                ├── Write tool events → track created files
-                ├── result event → final response sent to chat
-                └── created files → sent back as photos/documents
+                ├── OAuth bearer auth from Claude subscription
+                ├── Auto token refresh via stored credentials
+                ├── Streaming responses with live preview
+                ├── Agentic tool loop (up to 25 turns)
+                ├── Tools executed locally in Python
+                └── Written files sent back to Telegram
 ```
 
 Key implementation details:
-- Uses `subprocess.Popen` (not `subprocess.run`) for streaming output
-- Stdout is read line-by-line in a daemon thread, parsed as NDJSON
-- An `asyncio.Queue` bridges the reader thread to the async event loop
-- `CREATE_NO_WINDOW` flag on Windows prevents console popups
-- `stdin=DEVNULL` prevents the subprocess from hanging on input
-- Telegram photos/documents are downloaded to `downloads/` and passed to Claude via prompt
-- Files Claude writes are tracked during streaming and sent back to Telegram after the response
+- Calls the Anthropic Messages API directly — no Claude Code CLI or subprocess
+- Authenticates via OAuth token from `~/.claude/.credentials.json` with `anthropic-beta: oauth-2025-04-20`
+- Streaming via the `anthropic` Python SDK for real-time response preview
+- Tool results are fed back to the API for multi-turn agentic workflows
+- Conversation history (including tool use) persisted to `.history.json`
+- Large tool results truncated when saving to keep history manageable
 
 ## Security
 
 - Only responds to the Telegram user ID in `OWNER_TELEGRAM_ID` — all other messages are silently ignored
 - Your `.env` file contains secrets — never commit it
+- Tools run with full filesystem/shell access — this is a personal bot, not a multi-user service
 
 ## License
 
