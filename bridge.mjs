@@ -42,6 +42,7 @@ try {
       permissionMode: "bypassPermissions",
       allowDangerouslySkipPermissions: true,
       settingSources: ["user", "project"],
+      stderr: (data) => process.stderr.write(data),
     },
   });
 
@@ -49,6 +50,8 @@ try {
     process.stdout.write(JSON.stringify(message) + "\n");
   }
 } catch (err) {
+  const detail = err.stack || err.message || String(err);
+  process.stderr.write(`bridge error: ${detail}\n`);
   // Emit error as a result event so the Python caller can parse it uniformly
   process.stdout.write(
     JSON.stringify({
