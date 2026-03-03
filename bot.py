@@ -367,10 +367,35 @@ def _load_history() -> list[dict]:
         try:
             data = json.loads(HISTORY_FILE.read_text(encoding="utf-8"))
             if isinstance(data, list):
-                return data
+                return _sanitize_history(data)
         except (json.JSONDecodeError, OSError):
             pass
     return []
+
+def _sanitize_history(history: list[dict]) -> list[dict]:
+    """Remove trailing orphaned tool_use messages (no matching tool_result)."""
+    while len(history) >= 2:
+        last = history[-1]
+        prev = history[-2]
+        # Check if last assistant message has tool_use blocks
+        if prev.get("role") == "assistant" and isinstance(prev.get("content"), list):
+            has_tool_use = any(
+                isinstance(b, dict) and b.get("type") == "tool_use"
+                for b in prev["content"]
+            )
+            has_tool_result = (
+                last.get("role") == "user" and isinstance(last.get("content"), list)
+                and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                        for b in last["content"])
+            )
+            if has_tool_use and not has_tool_result:
+                # Orphaned tool_use — remove both messages
+                history.pop()
+                history.pop()
+                log.warning("Removed orphaned tool_use pair from history")
+                continue
+        break
+    return history
 
 def _save_history(history: list[dict]):
     MAX_SAVE = 2000
@@ -460,6 +485,9 @@ async def stream_claude(content_blocks: list, status_msg) -> tuple[str, list[str
     max_msgs = MAX_HISTORY * 2
     if len(conversation_history) > max_msgs:
         conversation_history = conversation_history[-max_msgs:]
+
+    # Fix any orphaned tool_use from a previous crash
+    conversation_history = _sanitize_history(conversation_history)
 
     written_files = []
     tool_log = []
