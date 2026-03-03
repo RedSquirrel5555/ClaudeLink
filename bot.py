@@ -353,7 +353,7 @@ async def _get_access_token() -> str:
 
 def _make_client(access_token: str) -> anthropic.AsyncAnthropic:
     return anthropic.AsyncAnthropic(
-        api_key="oauth",
+        api_key=None,
         default_headers={
             "Authorization": f"Bearer {access_token}",
             "anthropic-beta": OAUTH_BETA,
