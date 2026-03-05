@@ -1,0 +1,10 @@
+# Dependencies
+lib/
+node_modules/
+
+# Build artifacts
+/out/
+/cache/
+
+# Environment
+.env
