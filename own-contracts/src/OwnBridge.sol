@@ -9,25 +9,32 @@ import {SafeERC20} from "@openzeppelin/token/ERC20/utils/SafeERC20.sol";
 /**
  * @title OwnBridge
  * @notice Bidirectional bridge for OWN Protocol. Deployed on Base (USDC) and PulseChain (eUSDC).
- *         Lock tokens on source chain, Hyperlane message triggers release from LP on dest chain.
+ *         Lock tokens on source chain, Hyperlane message triggers release from LP pool on dest chain.
  *
  * @dev Architecture:
- *      - Service selects LP off-chain using proportional rotation algorithm.
- *      - LP address is encoded in the Hyperlane message via bridge().
- *      - handle() on dest chain verifies LP is registered + has capacity, then pulls from LP.
- *      - markSettled() on source chain distributes locked funds to LP + protocol.
+ *      - LPs deposit tokens into the pool. Pool fills all bridges — no LP selection needed.
+ *      - LP earnings are pro-rata via share accounting (ERC-4626 style).
+ *      - bridge() locks tokens on source, dispatches Hyperlane message.
+ *      - handle() on dest releases tokens from pool.
+ *      - markSettled() on source pays LP pool (increases share price) + protocol fee.
  *      - Users can always self-refund after REFUND_DELAY if settlement fails.
  *
- * LP Selection (off-chain, proportional rotation):
- *      - Service tracks cumulative fills per LP and allowances on dest chain.
- *      - Next fill goes to LP most underweight relative to their allowance share.
- *      - Over time, each LP's fill share converges to their capital share.
- *      - Contract only validates: is the selected LP registered? Do they have enough?
+ * LP Pool (share-based accounting):
+ *      - LPs deposit tokens, receive shares proportional to pool value.
+ *      - Settlements increase pool assets without minting shares → share price rises.
+ *      - LP withdraws shares at current price → principal + accumulated fees.
+ *      - Perfectly proportional. No selection algorithm. No race conditions.
  *
  * Fee structure:
- *      - 0.3% total deducted from bridge amount
- *      - 0.2% -> protocol-owned LP (compounds)
- *      - 0.1% -> filling LP (implicit spread: LP gives netAmount, receives amount - 0.2%)
+ *      - 0.3% total deducted from bridge amount on source chain
+ *      - 0.2% -> protocol fee address (external)
+ *      - 0.1% -> LP pool (increases share price for all depositors)
+ *
+ * Accounting note:
+ *      The contract holds two types of funds that must be tracked separately:
+ *      1. User deposits (pending settlement/refund) — tracked by deposit records
+ *      2. LP pool (available for fills) — tracked by poolAssets
+ *      token.balanceOf(this) = pending user deposits + poolAssets
  */
 contract OwnBridge is IMessageRecipient {
     using SafeERC20 for IERC20;
@@ -46,6 +53,9 @@ contract OwnBridge is IMessageRecipient {
     /// @notice Time after which user can self-refund an unsettled deposit
     uint256 public constant REFUND_DELAY = 2 hours;
 
+    /// @notice Minimum initial deposit to prevent share inflation attacks
+    uint256 public constant MIN_INITIAL_DEPOSIT = 1e6; // 1.0 USDC/eUSDC
+
     // ============ Immutables ============
 
     /// @notice Hyperlane Mailbox on this chain
@@ -59,14 +69,14 @@ contract OwnBridge is IMessageRecipient {
 
     // ============ State ============
 
-    /// @notice Service operator address (calls markSettled, manages LPs)
+    /// @notice Service operator address (calls markSettled, manages bridge)
     address public operator;
 
     /// @notice Pending operator for two-step transfer
     address public pendingOperator;
 
-    /// @notice Protocol-owned LP address (receives 0.2% fee, compounds)
-    address public protocolLP;
+    /// @notice Protocol fee recipient address
+    address public protocolFeeRecipient;
 
     /// @notice OwnBridge contract address on the remote chain (bytes32 for Hyperlane)
     bytes32 public remoteContract;
@@ -77,22 +87,24 @@ contract OwnBridge is IMessageRecipient {
     /// @notice Whether the contract is paused
     bool public paused;
 
-    // ============ LP State ============
+    // ============ LP Pool State ============
 
-    /// @notice Ordered list of active LP addresses for filling
-    address[] public activeLPs;
+    /// @notice Total assets in the LP pool (available for fills)
+    uint256 public poolAssets;
 
-    /// @notice Tracks whether an address is a registered LP
-    mapping(address => bool) public isLP;
+    /// @notice Total shares outstanding
+    uint256 public totalShares;
 
-    // ============ Deposit State ============
+    /// @notice Shares held by each LP
+    mapping(address => uint256) public lpShares;
+
+    // ============ Deposit State (source chain) ============
 
     struct Deposit {
         address user;           // depositor
         uint256 amount;         // gross amount locked (before fee split)
-        uint256 netAmount;      // amount sent to dest (after 0.3% fee)
+        uint256 netAmount;      // amount released on dest (after 0.3% fee)
         address destRecipient;  // recipient on dest chain
-        address selectedLP;     // LP selected to fill on dest chain
         uint64 timestamp;       // block.timestamp at deposit
         bool settled;           // markSettled() called
         bool refunded;          // refund() called
@@ -102,9 +114,8 @@ contract OwnBridge is IMessageRecipient {
 
     // ============ Release Tracking (dest chain) ============
 
-    /// @notice Records which LP filled each release (for future trustless settlement)
+    /// @notice Tracks releases for auditability
     struct Release {
-        address fillingLP;
         address recipient;
         uint256 amount;
         uint256 remoteNonce;
@@ -122,20 +133,17 @@ contract OwnBridge is IMessageRecipient {
         uint256 amount,
         uint256 netAmount,
         uint256 indexed nonce,
-        address selectedLP,
         bytes32 messageId
     );
 
     event Released(
         address indexed recipient,
-        address indexed fillingLP,
         uint256 amount,
         uint256 remoteNonce
     );
 
     event Settled(
         uint256 indexed nonce,
-        address indexed fillingLP,
         uint256 lpPayment,
         uint256 protocolFee
     );
@@ -146,11 +154,11 @@ contract OwnBridge is IMessageRecipient {
         uint256 indexed nonce
     );
 
-    event LPAdded(address indexed lp);
-    event LPRemoved(address indexed lp);
+    event LPDeposited(address indexed lp, uint256 amount, uint256 sharesMinted);
+    event LPWithdrawn(address indexed lp, uint256 amount, uint256 sharesBurned);
     event OperatorTransferStarted(address indexed current, address indexed pending);
     event OperatorTransferred(address indexed previous, address indexed current);
-    event ProtocolLPUpdated(address indexed previous, address indexed current);
+    event ProtocolFeeRecipientUpdated(address indexed previous, address indexed current);
     event RemoteContractUpdated(bytes32 previous, bytes32 current);
     event Paused(address indexed by);
     event Unpaused(address indexed by);
@@ -167,13 +175,12 @@ contract OwnBridge is IMessageRecipient {
     error DepositAlreadyRefunded();
     error RefundTooEarly();
     error NotDepositor();
-    error LPNotRegistered();
-    error InsufficientLPBalance();
-    error LPAlreadyActive();
-    error LPNotActive();
+    error InsufficientPool();
+    error InsufficientShares();
     error ContractPaused();
     error NotPendingOperator();
     error RemoteContractNotSet();
+    error InitialDepositTooSmall();
 
     // ============ Modifiers ============
 
@@ -194,48 +201,97 @@ contract OwnBridge is IMessageRecipient {
      * @param _token ERC20 token (USDC on Base, eUSDC on PulseChain)
      * @param _remoteDomain Hyperlane domain ID of dest chain
      * @param _operator Service operator address
-     * @param _protocolLP Protocol-owned LP address
+     * @param _protocolFeeRecipient Address that receives 0.2% protocol fee
      */
     constructor(
         address _mailbox,
         address _token,
         uint32 _remoteDomain,
         address _operator,
-        address _protocolLP
+        address _protocolFeeRecipient
     ) {
         if (_mailbox == address(0)) revert ZeroAddress();
         if (_token == address(0)) revert ZeroAddress();
         if (_operator == address(0)) revert ZeroAddress();
-        if (_protocolLP == address(0)) revert ZeroAddress();
+        if (_protocolFeeRecipient == address(0)) revert ZeroAddress();
 
         mailbox = IMailbox(_mailbox);
         token = IERC20(_token);
         remoteDomain = _remoteDomain;
         operator = _operator;
-        protocolLP = _protocolLP;
+        protocolFeeRecipient = _protocolFeeRecipient;
+    }
+
+    // ============ LP Pool Functions ============
+
+    /**
+     * @notice Deposit tokens into the LP pool. Receive shares proportional to pool value.
+     * @dev First depositor gets 1:1 shares. Subsequent depositors get shares at current price.
+     *      Minimum first deposit of 1 USDC to prevent share inflation attacks.
+     * @param amount Token amount to deposit
+     * @return shares Number of shares minted
+     */
+    function depositLP(uint256 amount) external whenNotPaused returns (uint256 shares) {
+        if (amount == 0) revert ZeroAmount();
+
+        if (totalShares == 0) {
+            // First deposit: 1:1 share ratio
+            if (amount < MIN_INITIAL_DEPOSIT) revert InitialDepositTooSmall();
+            shares = amount;
+        } else {
+            // Subsequent deposits: shares proportional to current pool value
+            // shares = amount * totalShares / poolAssets
+            shares = (amount * totalShares) / poolAssets;
+        }
+
+        token.safeTransferFrom(msg.sender, address(this), amount);
+        lpShares[msg.sender] += shares;
+        totalShares += shares;
+        poolAssets += amount;
+
+        emit LPDeposited(msg.sender, amount, shares);
+    }
+
+    /**
+     * @notice Withdraw tokens from the LP pool by burning shares.
+     * @dev Amount received = shares * poolAssets / totalShares.
+     *      If pool has earned fees, share price > 1 and LP gets back more than deposited.
+     * @param shares Number of shares to burn
+     * @return amount Token amount withdrawn
+     */
+    function withdrawLP(uint256 shares) external returns (uint256 amount) {
+        if (shares == 0) revert ZeroAmount();
+        if (lpShares[msg.sender] < shares) revert InsufficientShares();
+
+        // Calculate token amount for these shares
+        amount = (shares * poolAssets) / totalShares;
+
+        lpShares[msg.sender] -= shares;
+        totalShares -= shares;
+        poolAssets -= amount;
+
+        token.safeTransfer(msg.sender, amount);
+
+        emit LPWithdrawn(msg.sender, amount, shares);
     }
 
     // ============ User Functions ============
 
     /**
      * @notice Lock tokens for bridging to dest chain. Deducts 0.3% fee.
-     *         Dispatches Hyperlane message to release tokens from selected LP on dest.
+     *         Dispatches Hyperlane message to release tokens from LP pool on dest.
      * @param amount Gross amount to bridge (fee deducted from this)
      * @param destRecipient Recipient address on dest chain.
      *        - Bridge mode / eUSDC on-ramp: user's own address
      *        - Token on-ramp: service swap executor address
-     * @param selectedLP LP address pre-selected by the service to fill on dest chain.
-     *        Encoded in the Hyperlane message. handle() validates this on dest chain.
      * @return depositNonce The nonce of this deposit
      */
     function bridge(
         uint256 amount,
-        address destRecipient,
-        address selectedLP
+        address destRecipient
     ) external payable whenNotPaused returns (uint256 depositNonce) {
         if (amount == 0) revert ZeroAmount();
         if (destRecipient == address(0)) revert ZeroAddress();
-        if (selectedLP == address(0)) revert ZeroAddress();
         if (remoteContract == bytes32(0)) revert RemoteContractNotSet();
 
         // Calculate fees
@@ -252,22 +308,20 @@ contract OwnBridge is IMessageRecipient {
             amount: amount,
             netAmount: netAmount,
             destRecipient: destRecipient,
-            selectedLP: selectedLP,
             timestamp: uint64(block.timestamp),
             settled: false,
             refunded: false
         });
 
         // Dispatch Hyperlane message to dest chain
-        // Payload includes selectedLP so handle() knows who to pull from
-        bytes memory payload = abi.encode(destRecipient, netAmount, depositNonce, selectedLP);
+        bytes memory payload = abi.encode(destRecipient, netAmount, depositNonce);
         bytes32 messageId = mailbox.dispatch{value: msg.value}(
             remoteDomain,
             remoteContract,
             payload
         );
 
-        emit Bridged(msg.sender, destRecipient, amount, netAmount, depositNonce, selectedLP, messageId);
+        emit Bridged(msg.sender, destRecipient, amount, netAmount, depositNonce, messageId);
         nonce++;
     }
 
@@ -294,10 +348,8 @@ contract OwnBridge is IMessageRecipient {
 
     /**
      * @notice Called by Hyperlane Mailbox when a message arrives from the remote OwnBridge.
-     *         Validates the pre-selected LP and releases tokens from their allowance.
-     * @dev The LP was selected off-chain by the service using proportional rotation,
-     *      then encoded in the Hyperlane message at bridge() time on source chain.
-     *      This function validates: LP is registered, has sufficient allowance + balance.
+     *         Releases tokens from the LP pool to the recipient.
+     * @dev No LP selection needed — pool fills everything. Just check pool has capacity.
      */
     function handle(
         uint32 _origin,
@@ -308,20 +360,17 @@ contract OwnBridge is IMessageRecipient {
         if (_origin != remoteDomain) revert WrongOriginDomain();
         if (_sender != remoteContract) revert NotRemoteContract();
 
-        (address recipient, uint256 amount, uint256 remoteNonce, address selectedLP) =
-            abi.decode(_payload, (address, uint256, uint256, address));
+        (address recipient, uint256 amount, uint256 remoteNonce) =
+            abi.decode(_payload, (address, uint256, uint256));
 
-        // Validate the pre-selected LP
-        if (!isLP[selectedLP]) revert LPNotRegistered();
-        if (token.allowance(selectedLP, address(this)) < amount) revert InsufficientLPBalance();
-        if (token.balanceOf(selectedLP) < amount) revert InsufficientLPBalance();
+        if (poolAssets < amount) revert InsufficientPool();
 
-        // Pull tokens from LP's wallet (allowance model — funds stay in LP wallet until needed)
-        token.safeTransferFrom(selectedLP, recipient, amount);
+        // Release from pool
+        poolAssets -= amount;
+        token.safeTransfer(recipient, amount);
 
-        // Record release for future trustless settlement
+        // Record release
         releases[releaseCount] = Release({
-            fillingLP: selectedLP,
             recipient: recipient,
             amount: amount,
             remoteNonce: remoteNonce,
@@ -329,76 +378,38 @@ contract OwnBridge is IMessageRecipient {
         });
         releaseCount++;
 
-        emit Released(recipient, selectedLP, amount, remoteNonce);
+        emit Released(recipient, amount, remoteNonce);
     }
 
     // ============ Operator Functions ============
 
     /**
-     * @notice Settle a deposit: pay the filling LP and protocol fee.
+     * @notice Settle a deposit: feed LP payment back to pool, send protocol fee externally.
      *         Called by operator after confirming handle() succeeded on dest chain.
-     * @dev Launch: operator provides fillingLP (trusted). Should match deposit.selectedLP.
-     *      Future: verify fillingLP against dest chain Released event or return message.
+     * @dev LP payment goes back into poolAssets without minting new shares.
+     *      This increases the share price — every LP benefits proportionally.
+     *      Protocol fee is sent to protocolFeeRecipient (not pooled).
      * @param _nonce Deposit nonce on this (source) chain
-     * @param fillingLP LP address that released tokens on dest chain
      */
-    function markSettled(uint256 _nonce, address fillingLP) external onlyOperator {
+    function markSettled(uint256 _nonce) external onlyOperator {
         Deposit storage d = deposits[_nonce];
         if (d.settled) revert DepositAlreadySettled();
         if (d.refunded) revert DepositAlreadyRefunded();
-        if (fillingLP == address(0)) revert ZeroAddress();
 
         d.settled = true;
 
-        // Protocol fee: 0.2% of gross amount
+        // Protocol fee: 0.2% of gross amount → external recipient
         uint256 protocolFee = (d.amount * PROTOCOL_FEE_BPS) / BPS_DENOMINATOR;
 
-        // LP payment: gross amount minus protocol fee
-        // LP profit = lpPayment - netAmount = 0.1% of gross (implicit spread)
+        // LP payment: gross amount minus protocol fee → back to pool
+        // LP pool profit = lpPayment - netAmount = 0.1% of gross
+        // This increases poolAssets without minting shares → share price rises
         uint256 lpPayment = d.amount - protocolFee;
 
-        token.safeTransfer(fillingLP, lpPayment);
-        token.safeTransfer(protocolLP, protocolFee);
+        poolAssets += lpPayment;
+        token.safeTransfer(protocolFeeRecipient, protocolFee);
 
-        emit Settled(_nonce, fillingLP, lpPayment, protocolFee);
-    }
-
-    // ============ LP Management ============
-
-    /**
-     * @notice Register a new LP. LP must separately approve this contract for token.
-     * @param lp Address to register as LP
-     */
-    function addLP(address lp) external onlyOperator {
-        if (lp == address(0)) revert ZeroAddress();
-        if (isLP[lp]) revert LPAlreadyActive();
-
-        isLP[lp] = true;
-        activeLPs.push(lp);
-
-        emit LPAdded(lp);
-    }
-
-    /**
-     * @notice Remove an LP from the active list. Does not revoke their token allowance.
-     * @param lp Address to remove
-     */
-    function removeLP(address lp) external onlyOperator {
-        if (!isLP[lp]) revert LPNotActive();
-
-        isLP[lp] = false;
-
-        // Remove from array (swap with last element)
-        uint256 len = activeLPs.length;
-        for (uint256 i = 0; i < len; i++) {
-            if (activeLPs[i] == lp) {
-                activeLPs[i] = activeLPs[len - 1];
-                activeLPs.pop();
-                break;
-            }
-        }
-
-        emit LPRemoved(lp);
+        emit Settled(_nonce, lpPayment, protocolFee);
     }
 
     // ============ Admin Functions ============
@@ -424,13 +435,13 @@ contract OwnBridge is IMessageRecipient {
     }
 
     /**
-     * @notice Update protocol-owned LP address
+     * @notice Update protocol fee recipient address
      */
-    function setProtocolLP(address _protocolLP) external onlyOperator {
-        if (_protocolLP == address(0)) revert ZeroAddress();
-        address previous = protocolLP;
-        protocolLP = _protocolLP;
-        emit ProtocolLPUpdated(previous, _protocolLP);
+    function setProtocolFeeRecipient(address _recipient) external onlyOperator {
+        if (_recipient == address(0)) revert ZeroAddress();
+        address previous = protocolFeeRecipient;
+        protocolFeeRecipient = _recipient;
+        emit ProtocolFeeRecipientUpdated(previous, _recipient);
     }
 
     /**
@@ -443,7 +454,7 @@ contract OwnBridge is IMessageRecipient {
     }
 
     /**
-     * @notice Emergency pause — stops new bridges. Refunds still work.
+     * @notice Emergency pause — stops new bridges and LP deposits. Withdrawals and refunds still work.
      */
     function pause() external onlyOperator {
         paused = true;
@@ -461,20 +472,6 @@ contract OwnBridge is IMessageRecipient {
     // ============ View Functions ============
 
     /**
-     * @notice Get number of active LPs
-     */
-    function activeLPCount() external view returns (uint256) {
-        return activeLPs.length;
-    }
-
-    /**
-     * @notice Get all active LP addresses
-     */
-    function getActiveLPs() external view returns (address[] memory) {
-        return activeLPs;
-    }
-
-    /**
      * @notice Quote the fee and net amount for a given bridge amount
      */
     function quote(uint256 amount) external pure returns (uint256 netAmount, uint256 totalFee) {
@@ -485,59 +482,52 @@ contract OwnBridge is IMessageRecipient {
     /**
      * @notice Quote the Hyperlane dispatch fee for a bridge call
      */
-    function quoteDispatch(
-        uint256 amount,
-        address destRecipient,
-        address selectedLP
-    ) external view returns (uint256) {
+    function quoteDispatch(uint256 amount, address destRecipient) external view returns (uint256) {
         if (remoteContract == bytes32(0)) revert RemoteContractNotSet();
         uint256 totalFee = (amount * TOTAL_FEE_BPS) / BPS_DENOMINATOR;
         uint256 netAmount = amount - totalFee;
-        bytes memory payload = abi.encode(destRecipient, netAmount, nonce, selectedLP);
+        bytes memory payload = abi.encode(destRecipient, netAmount, nonce);
         return mailbox.quoteDispatch(remoteDomain, remoteContract, payload);
     }
 
     /**
-     * @notice Check if a specific LP can fill a given amount
+     * @notice Check if pool can fill a given amount
      */
-    function canFill(address lp, uint256 amount) external view returns (bool) {
-        return isLP[lp]
-            && token.allowance(lp, address(this)) >= amount
-            && token.balanceOf(lp) >= amount;
+    function canFill(uint256 amount) external view returns (bool) {
+        return poolAssets >= amount;
     }
 
     /**
-     * @notice Get total fillable capacity across all active LPs
+     * @notice Current share price (tokens per share, scaled by 1e6 for precision)
+     * @dev Returns 1e6 when shares are at 1:1 with tokens.
+     *      Returns > 1e6 when pool has earned fees.
      */
-    function totalCapacity() external view returns (uint256 total) {
-        uint256 len = activeLPs.length;
-        for (uint256 i = 0; i < len; i++) {
-            address lp = activeLPs[i];
-            uint256 allowance = token.allowance(lp, address(this));
-            uint256 balance = token.balanceOf(lp);
-            total += allowance < balance ? allowance : balance;
-        }
+    function sharePrice() external view returns (uint256) {
+        if (totalShares == 0) return 1e6;
+        return (poolAssets * 1e6) / totalShares;
     }
 
     /**
-     * @notice Get capacity for each active LP (for service-side LP selection)
-     * @return lps Array of LP addresses
-     * @return capacities Array of fillable amounts (min of allowance, balance)
+     * @notice Get the current token value of an LP's shares
      */
-    function getLPCapacities() external view returns (
-        address[] memory lps,
-        uint256[] memory capacities
-    ) {
-        uint256 len = activeLPs.length;
-        lps = new address[](len);
-        capacities = new uint256[](len);
+    function lpValue(address lp) external view returns (uint256) {
+        if (totalShares == 0) return 0;
+        return (lpShares[lp] * poolAssets) / totalShares;
+    }
 
-        for (uint256 i = 0; i < len; i++) {
-            address lp = activeLPs[i];
-            uint256 allowance = token.allowance(lp, address(this));
-            uint256 balance = token.balanceOf(lp);
-            lps[i] = lp;
-            capacities[i] = allowance < balance ? allowance : balance;
-        }
+    /**
+     * @notice Preview how many shares would be minted for a deposit amount
+     */
+    function previewDeposit(uint256 amount) external view returns (uint256) {
+        if (totalShares == 0) return amount;
+        return (amount * totalShares) / poolAssets;
+    }
+
+    /**
+     * @notice Preview how many tokens would be returned for burning shares
+     */
+    function previewWithdraw(uint256 shares) external view returns (uint256) {
+        if (totalShares == 0) return 0;
+        return (shares * poolAssets) / totalShares;
     }
 }

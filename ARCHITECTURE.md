@@ -103,7 +103,9 @@ One contract per chain. Dramatically simpler than the HTLC design.
 
 ### OwnBridge.sol (deployed on Base and PulseChain)
 
-Bidirectional bridge contract. Handles locking, Hyperlane dispatch, message receipt, LP release, and refunds.
+Bidirectional bridge contract with LP pool. Handles locking, Hyperlane dispatch, message receipt, pool-based fills, and refunds.
+
+**LP pool model:** LPs deposit into a shared pool. Fills draw from the pool. Settlements feed LP payments back — increasing share price for all depositors. No LP selection needed. Perfectly proportional. ERC-4626-style share accounting.
 
 ```solidity
 contract OwnBridge is IMessageRecipient {
@@ -111,106 +113,97 @@ contract OwnBridge is IMessageRecipient {
     IERC20 public immutable token;     // USDC on Base, eUSDC on PulseChain
     uint32 public immutable remoteDomain;
 
-    address public operator;            // service operator
-    address public protocolLP;          // protocol-owned LP address
-    bytes32 public remoteContract;      // OwnBridge on other chain
+    address public operator;
+    address public protocolFeeRecipient;
+    bytes32 public remoteContract;
+
+    // LP Pool (share-based accounting)
+    uint256 public poolAssets;           // total tokens in pool
+    uint256 public totalShares;          // total shares outstanding
+    mapping(address => uint256) public lpShares;
 
     uint256 public nonce;
     mapping(uint256 => Deposit) public deposits;
-    mapping(address => bool) public isLP;
-    address[] public activeLPs;
 
     struct Deposit {
         address user;
         uint256 amount;
         uint256 netAmount;
         address destRecipient;
-        address selectedLP;     // LP pre-selected by service
         uint64 timestamp;
         bool settled;
         bool refunded;
     }
 
-    // --- User locks tokens, service provides selected LP ---
-    function bridge(uint256 amount, address destRecipient, address selectedLP) external payable {
-        uint256 totalFee = amount * 30 / 10000;  // 0.3% total
-        uint256 netAmount = amount - totalFee;
-
+    // --- LP deposits into pool, receives proportional shares ---
+    function depositLP(uint256 amount) external {
+        uint256 shares = totalShares == 0 ? amount : amount * totalShares / poolAssets;
         token.transferFrom(msg.sender, address(this), amount);
+        lpShares[msg.sender] += shares;
+        totalShares += shares;
+        poolAssets += amount;
+    }
 
+    // --- LP withdraws shares at current price (principal + earned fees) ---
+    function withdrawLP(uint256 shares) external {
+        uint256 amount = shares * poolAssets / totalShares;
+        lpShares[msg.sender] -= shares;
+        totalShares -= shares;
+        poolAssets -= amount;
+        token.transfer(msg.sender, amount);
+    }
+
+    // --- User locks tokens for bridging ---
+    function bridge(uint256 amount, address destRecipient) external payable {
+        uint256 totalFee = amount * 30 / 10000;  // 0.3%
+        uint256 netAmount = amount - totalFee;
+        token.transferFrom(msg.sender, address(this), amount);
         deposits[nonce] = Deposit(msg.sender, amount, netAmount, destRecipient,
-                                   selectedLP, uint64(block.timestamp), false, false);
-
-        // LP address encoded in message — dest chain validates + pulls from this LP
-        bytes32 messageId = mailbox.dispatch{value: msg.value}(
-            remoteDomain,
-            remoteContract,
-            abi.encode(destRecipient, netAmount, nonce, selectedLP)
-        );
-
-        emit Bridged(msg.sender, destRecipient, amount, netAmount, nonce, selectedLP, messageId);
+                                   uint64(block.timestamp), false, false);
+        mailbox.dispatch{value: msg.value}(remoteDomain, remoteContract,
+            abi.encode(destRecipient, netAmount, nonce));
         nonce++;
     }
 
-    // --- Receive message, validate selected LP, release tokens ---
-    function handle(
-        uint32 _origin,
-        bytes32 _sender,
-        bytes calldata _payload
-    ) external payable {
+    // --- Receive message, release from pool ---
+    function handle(uint32 _origin, bytes32 _sender, bytes calldata _payload) external payable {
         require(msg.sender == address(mailbox));
-        require(_origin == remoteDomain);
-        require(_sender == remoteContract);
-
-        (address recipient, uint256 amount, uint256 remoteNonce, address selectedLP) =
-            abi.decode(_payload, (address, uint256, uint256, address));
-
-        // Validate: LP must be registered and have sufficient capacity
-        require(isLP[selectedLP], "LP not registered");
-        require(token.allowance(selectedLP, address(this)) >= amount, "insufficient allowance");
-        require(token.balanceOf(selectedLP) >= amount, "insufficient balance");
-
-        token.transferFrom(selectedLP, recipient, amount);
-
-        emit Released(recipient, selectedLP, amount, remoteNonce);
+        require(_origin == remoteDomain && _sender == remoteContract);
+        (address recipient, uint256 amount, uint256 remoteNonce) =
+            abi.decode(_payload, (address, uint256, uint256));
+        require(poolAssets >= amount);
+        poolAssets -= amount;
+        token.transfer(recipient, amount);
     }
 
-    // --- Service confirms release, pays LP, takes protocol fee ---
-    function markSettled(uint256 _nonce, address fillingLP) external onlyOperator {
+    // --- Settlement: LP payment → pool (share price rises), protocol fee → external ---
+    function markSettled(uint256 _nonce) external onlyOperator {
         Deposit storage d = deposits[_nonce];
         require(!d.settled && !d.refunded);
         d.settled = true;
-
-        uint256 protocolFee = d.amount * 20 / 10000;   // 0.2% protocol fee
-        uint256 lpPayment = d.amount - protocolFee;      // LP gets rest (implicit 0.1% profit)
-
-        token.transfer(fillingLP, lpPayment);
-        token.transfer(protocolLP, protocolFee);
-
-        emit Settled(_nonce, fillingLP, lpPayment, protocolFee);
+        uint256 protocolFee = d.amount * 20 / 10000;   // 0.2%
+        uint256 lpPayment = d.amount - protocolFee;
+        poolAssets += lpPayment;                         // share price increases
+        token.transfer(protocolFeeRecipient, protocolFee);
     }
 
-    // --- Refund if settlement fails after timeout ---
+    // --- Refund if settlement fails ---
     function refund(uint256 _nonce) external {
         Deposit storage d = deposits[_nonce];
-        require(d.user == msg.sender);
-        require(!d.settled && !d.refunded);
+        require(d.user == msg.sender && !d.settled && !d.refunded);
         require(block.timestamp >= d.timestamp + 2 hours);
-
         d.refunded = true;
         token.transfer(msg.sender, d.amount);
-
-        emit Refunded(msg.sender, d.amount, _nonce);
     }
 
-    // --- View: LP capacities for service-side selection ---
-    function getLPCapacities() external view returns (address[] memory, uint256[] memory) { ... }
-    function canFill(address lp, uint256 amount) external view returns (bool) { ... }
-    function totalCapacity() external view returns (uint256) { ... }
+    // --- Views ---
+    function sharePrice() external view returns (uint256) { ... }   // tokens per share
+    function lpValue(address lp) external view returns (uint256) { ... }
+    function canFill(uint256 amount) external view returns (bool) { ... }
 }
 ```
 
-**Note:** The pseudocode above is simplified. The full implementation is in `own-contracts/src/OwnBridge.sol` with SafeERC20, custom errors, pause/unpause, two-step operator transfer, release tracking, and comprehensive NatSpec. 56 tests passing including fuzz tests.
+**Note:** The pseudocode above is simplified. The full implementation is in `own-contracts/src/OwnBridge.sol` with SafeERC20, custom errors, pause/unpause, two-step operator transfer, release tracking, share inflation protection, and comprehensive NatSpec. 64 tests passing including 4 fuzz suites.
 
 ### What This Eliminates
 
@@ -225,22 +218,24 @@ Removed (HTLC era):
   - Matcher engine
   - Timelock coordination (1hr + 2hr)
 
-Added (Hyperlane era):
-  + OwnBridge.sol on Base (lock USDC + dispatch message with selected LP)
-  + OwnBridge.sol on PulseChain (receive message + validate LP + release eUSDC)
-  + bridge(amount, destRecipient, selectedLP) — LP pre-selected by service
-  + handle() validates LP registration + capacity, then pulls from LP allowance
-  + markSettled() — operator confirms release, pays LP, takes protocol fee
+Added (Hyperlane + Pool era):
+  + OwnBridge.sol on Base (lock USDC + dispatch message)
+  + OwnBridge.sol on PulseChain (receive message + release from LP pool)
+  + LP pool with share-based accounting (ERC-4626 style)
+  + depositLP() / withdrawLP() — LPs deposit into pool, withdraw at share price
+  + bridge(amount, destRecipient) — simple, no LP selection needed
+  + handle() releases from pool — no LP validation, no race conditions
+  + markSettled() feeds LP payment back to pool (share price rises automatically)
   + 3 on-chain txs per bridge: bridge() + handle() + markSettled()
   + Fully automatic settlement, no user action on dest chain
   + Refund timeout (2hr escape hatch if settlement fails)
-  + LP selection: proportional rotation off-chain (launch), on-chain (growth)
-  + View functions for service: getLPCapacities(), canFill(), totalCapacity()
+  + Perfectly proportional LP earnings by design — no selection algorithm needed
 
-Unchanged:
-  = LP allowance model (funds stay in wallet)
-  = Protocol-owned LP compounding
-  = LP fee is implicit spread (0.1%)
+Changed from original design:
+  × LP allowance model → LP pool model (funds custodied in contract)
+  × Individual LP selection → pool fills everything proportionally
+  = Protocol fee still sent externally (0.2%)
+  = LP earnings still 0.1% spread (now via share price appreciation)
 ```
 
 ### Deployments
@@ -266,7 +261,7 @@ Two contract deployments total.
     -> 500 USDC locked in contract, Hyperlane message dispatched
     -> destRecipient = service swap executor (NOT user) when token != eUSDC
 5.  ~30-60 seconds later, OwnBridge.handle() fires on PulseChain
-    -> 498.50 eUSDC released from LP's allowance to service swap executor
+    -> 498.50 eUSDC released from LP pool to service swap executor
 6.  Service swaps 498.50 eUSDC -> PLS via SquirrelSwap on PulseChain
     -> Service pays PulseChain gas (~fractions of a cent)
     -> Sends PLS output to user's wallet
@@ -310,8 +305,8 @@ Mirror of the "From Base" off-ramp. Useful for users who want USDC on Base for D
 4.  Service calls OwnBridge.bridge(eUSDC amount, userBaseAddress) on PulseChain
     -> eUSDC locked in contract, Hyperlane message dispatched
 5.  OwnBridge.handle() fires on Base
-    -> USDC released from LP's allowance to user on Base
-6.  Service calls markSettled(nonce, lpAddress) on PulseChain
+    -> USDC released from LP pool to user on Base
+6.  Service calls markSettled(nonce) on PulseChain
     -> LP receives eUSDC, Protocol LP receives 0.2% fee
     -> LP rebalanced: gave USDC on Base, received eUSDC on PulseChain
 7.  Peer offramp: user sells USDC for fiat
@@ -353,8 +348,8 @@ Base -> PulseChain:
 2.  OwnBridge.bridge(1000 USDC, userPulseAddress) on Base
     -> 1000 USDC locked in contract, Hyperlane message dispatched
 3.  ~30-60 seconds later, OwnBridge.handle() fires on PulseChain
-    -> 997.00 eUSDC released from LP's allowance directly to user
-4.  Service calls markSettled(nonce, lpAddress) on Base
+    -> 997.00 eUSDC released from LP pool directly to user
+4.  Service calls markSettled(nonce) on Base
     -> LP receives 998.00 USDC, Protocol LP receives 2.00 USDC
     -> LP profit: 998.00 - 997.00 = 1.00 (0.1%)
 5.  User has eUSDC on PulseChain
@@ -444,158 +439,54 @@ Even at $50 transactions (fee = $0.15), gas is negligible.
 
 ---
 
-## LP Selection
+## LP Pool Model
 
-LP selection directly affects LP retention, fairness, and capital efficiency. The core principle: **fill share ∝ allowance share.** More capital committed → more fills → more earnings. Fair, transparent, incentivises LPs to increase allowance.
+The pool replaces the original allowance-based LP selection. Instead of individual LPs being selected to fill specific bridges, all LPs deposit into a shared pool. Fills draw from the pool. Settlement payments flow back to the pool, increasing share price for all depositors.
 
-### Launch: Service Selects Off-Chain (Proportional Rotation)
+### Why Pool Over Allowances
 
-The service selects the LP before dispatching the Hyperlane message. The LP address is encoded in the message payload via `bridge(amount, destRecipient, selectedLP)`. The contract on dest chain validates: is the selected LP registered? Do they have sufficient allowance + balance? If yes, pull. If not, revert.
-
-The service uses **proportional rotation** — deterministic, no randomness:
+The allowance model ("LP funds stay in wallet") created real engineering problems:
 
 ```
-Track cumulative fills per LP.
-Next fill goes to the LP who is most underweight relative to their allowance share.
-
-LP A: $10,000 allowance (66.7%), filled $5,000 so far (62.5%) → underweight
-LP B: $3,000 allowance  (20.0%), filled $2,000 so far (25.0%) → overweight
-LP C: $1,500 allowance  (10.0%), filled $1,000 so far (12.5%) → overweight
-
-Next fill → LP A (most underweight)
+Allowance problems solved by pool:
+  ❌ LP selection fairness → pool fills proportionally by design
+  ❌ Race conditions (LP revokes/spends mid-fill) → funds committed in contract
+  ❌ Stale allowance state → pool balance is authoritative
+  ❌ Front-running by LPs → not possible with deposited funds
+  ❌ LP composability illusion → most LPs weren't using funds elsewhere anyway
 ```
 
-Over time, each LP's fill share converges to their allowance share.
-
-Service-side implementation:
-
-```typescript
-function selectLP(amount: bigint, lps: LP[]): LP {
-    const eligible = lps.filter(lp => lp.allowance >= amount);
-    if (eligible.length === 0) return null;
-
-    const totalAllowance = eligible.reduce((sum, lp) => sum + lp.allowance, 0n);
-
-    let bestLP = eligible[0];
-    let bestDeficit = -Infinity;
-
-    for (const lp of eligible) {
-        const targetShare = Number(lp.allowance) / Number(totalAllowance);
-        const totalFilled = eligible.reduce((s, l) => s + l.totalFilled, 0n) || 1n;
-        const actualShare = lp.totalFilled === 0n ? 0 :
-            Number(lp.totalFilled) / Number(totalFilled);
-        const deficit = targetShare - actualShare;
-
-        if (deficit > bestDeficit) {
-            bestDeficit = deficit;
-            bestLP = lp;
-        }
-    }
-
-    return bestLP;
-}
-```
-
-Why service-side at launch:
-- Service already monitors LP allowances via RPC.
-- Service already calls markSettled() — same trust surface.
-- Contract stays simple: validate + execute, no policy logic.
-- Selection algorithm is upgradeable without redeploying contracts.
-
-### Growth: On-Chain Proportional Rotation
-
-When enough LPs exist that operator selection becomes a trust concern, move selection on-chain:
-
-```solidity
-mapping(address => uint256) public lpFillVolume;
-uint256 public totalFillVolume;
-
-function selectLP(uint256 amount) internal returns (address) {
-    // Protocol LP gets priority for small fills
-    if (protocolLP != address(0) &&
-        token.allowance(protocolLP, address(this)) >= amount &&
-        amount <= PROTOCOL_LP_MAX_FILL) {
-        return protocolLP;
-    }
-
-    // Find most underweight LP
-    address best = address(0);
-    int256 bestDeficit = type(int256).min;
-
-    uint256 totalAllowance = 0;
-    for (uint i = 0; i < activeLPs.length; i++) {
-        totalAllowance += token.allowance(activeLPs[i], address(this));
-    }
-
-    for (uint i = 0; i < activeLPs.length; i++) {
-        uint256 allowance = token.allowance(activeLPs[i], address(this));
-        if (allowance < amount) continue;
-
-        int256 deficit = int256(allowance * totalFillVolume) -
-                         int256(lpFillVolume[activeLPs[i]] * totalAllowance);
-
-        if (deficit > bestDeficit) {
-            bestDeficit = deficit;
-            best = activeLPs[i];
-        }
-    }
-
-    require(best != address(0), "no LP available");
-
-    lpFillVolume[best] += amount;
-    totalFillVolume += amount;
-
-    return best;
-}
-```
-
-Gas cost scales linearly with LP count, but PulseChain gas is fractions of a cent. Even with 50 LPs, the loop costs effectively nothing.
-
-### Protocol LP Priority
-
-The protocol-owned LP gets **priority for small fills** to accelerate its compounding. Not for large fills — that's what external LPs are for.
+### How It Works
 
 ```
-Fill $50:    Protocol LP fills (if sufficient) → compounds faster
-Fill $500:   Proportional rotation among all LPs
-Fill $5,000: Proportional rotation, protocol LP participates at its weight
+Pool: $150,000 total
+  LP A deposited: $100,000 → 100,000 shares (66.7%)
+  LP B deposited: $50,000  → 50,000 shares  (33.3%)
+
+$1,000 bridge fills from pool:
+  Pool reduces by $1,000 → $149,000
+  Shares unchanged
+
+$998 LP payment arrives via markSettled():
+  Pool increases by $998 → $149,998
+  Shares unchanged → share price rises
+
+LP A's value: 100,000 * 149,998 / 150,000 = $99,998.67
+LP B's value: 50,000 * 149,998 / 150,000 = $49,999.33
+
+Net effect per LP (after fill + settlement cycle):
+  LP A: earned $0.667 (66.7% of $1 pool profit)
+  LP B: earned $0.333 (33.3% of $1 pool profit)
+  Perfectly proportional. No selection algorithm needed.
 ```
 
-This accelerates the flywheel without disadvantaging external LPs on meaningful volume.
+### Late Joiners Don't Get Past Earnings
 
-### Multi-LP Fills (Large Transactions)
+Share price reflects accumulated earnings. LP C joining after fees have been earned pays the current share price — they get fewer shares per dollar, so they don't dilute existing LPs' earned fees.
 
-When no single LP can cover the amount, split across multiple LPs. Each LP is credited proportionally and earns 0.1% on the portion they filled. Still atomic — either the full amount releases or everything reverts.
+### Protocol as LP
 
-```
-$5,000 bridge, no single LP has $5,000:
-  LP A fills $2,000 (from $3,000 allowance)
-  LP B fills $2,000 (from $3,000 allowance)
-  LP C fills $1,000 (from $1,500 allowance)
-  Total: $5,000 released to user in one transaction
-```
-
-Launch: cap transaction size to largest single LP capacity. Growth: implement multi-LP splitting in handle().
-
-### Summary
-
-```
-Launch:
-  Service selects LP off-chain (proportional rotation)
-  Encoded in Hyperlane message via bridge(amount, dest, selectedLP)
-  Contract verifies LP is registered + has allowance
-  Simple, works, acceptable trust model
-
-Growth:
-  Move selection on-chain (proportional rotation)
-  Protocol LP gets priority on small fills
-  Multi-LP fills for large transactions
-  Fully deterministic, no operator discretion
-
-The key principle: fill share ∝ allowance share
-  More capital committed → more fills → more earnings
-  Fair, transparent, incentivises LPs to increase allowance
-```
+The protocol can be a depositor in its own pool. Protocol's shares earn the same proportional yield as any other LP. No special priority logic needed — the pool handles it.
 
 ---
 
@@ -648,34 +539,34 @@ Off-ramp is partially manual for V1. User gets USDC on Base, then uses Peer dire
 
 ### How It Works
 
-LPs approve OwnBridge on each chain. Funds stay in their wallet until a bridge is filled.
+LPs deposit tokens into the OwnBridge pool on each chain. Fills draw from the pool. Settlement payments flow back, increasing share price for all depositors.
 
 ```
-1. LP approves OwnBridge on PulseChain for eUSDC (one-time)
-2. LP approves OwnBridge on Base for USDC (one-time)
+1. LP deposits eUSDC into OwnBridge pool on PulseChain
+2. LP deposits USDC into OwnBridge pool on Base
 3. User bridges $500 Base -> PulseChain
-4. handle() pulls 498.50 eUSDC from LP's allowance on PulseChain -> user
-5. markSettled() sends 499.00 USDC to LP on Base
-6. LP now has 499.00 more USDC on Base, 498.50 less eUSDC on PulseChain
-7. Net LP profit: $0.50
+4. handle() releases 498.50 eUSDC from pool on PulseChain -> user
+5. markSettled() adds 499.00 USDC to pool on Base (share price rises)
+6. All pool depositors earn proportionally
+7. LP's share of pool profit: $0.50 * (their share %)
 ```
 
-LP does nothing after initial approval. Settlement is fully automatic.
+LP does nothing after initial deposit. Earnings are automatic via share price appreciation. Withdraw anytime at current share price (principal + accumulated fees).
 
-For the PulseChain corridor, LPs need:
-- **eUSDC on PulseChain** (for on-ramp fills)
-- **USDC on Base** (for off-ramp fills)
+For the PulseChain corridor, pools need:
+- **eUSDC pool on PulseChain** (for on-ramp fills)
+- **USDC pool on Base** (for off-ramp fills)
 
-The same LP naturally serves both directions. Every on-ramp pushes LP balance toward Base. Every off-ramp pushes it back toward PulseChain. Bidirectional flow keeps the LP balanced automatically.
+Bidirectional flow naturally rebalances pools. On-ramp depletes PulseChain pool but replenishes Base pool via settlement. Off-ramp does the reverse.
 
 ### LP Pitch
 
-- One token, one corridor -- simple
-- 0.1% on every fill, no impermanent loss (stables <-> stables)
-- Zero lockup -- allowance model, funds stay in wallet
-- No active management -- fully automatic via Hyperlane
+- Deposit and earn — standard vault model every DeFi user knows
+- 0.1% fee on every bridge, shared proportionally, no impermanent loss
+- Withdraw anytime at current share price
+- No active management — fully automatic via share price appreciation
 - Natural rebalancing from bidirectional flow
-- Captive flow -- every fiat on-ramp user goes through LPs
+- Captive flow — every fiat on-ramp user generates yield for the pool
 
 ### What Attracts Early LPs
 
@@ -744,10 +635,10 @@ Slow burn. Long-term moat, not launch strategy.
 ```
 User bridges $500 (applies to all three modes):
   bridge() deducts 0.3% total fee    -> netAmount = 498.50 (sent in Hyperlane message)
-  handle() releases 498.50 to user   -> LP gives 498.50 from allowance
+  handle() releases 498.50 to user   -> pool gives 498.50
   markSettled() distributes locked funds:
-    -> LP receives:       499.00 (amount - 0.2% protocol fee)
-    -> Protocol LP gets:    1.00 (0.2% protocol fee, compounds)
+    -> LP pool receives:    499.00 (amount - 0.2% protocol fee, share price rises)
+    -> Protocol gets:         1.00 (0.2% protocol fee, sent externally)
 
 LP fee is implicit:
   LP gave 498.50 on dest chain, received 499.00 on source chain
@@ -838,14 +729,14 @@ Direct Base modes are still the cheapest paths (~0.8% typical). On-ramp to Base 
 
 ### On-Chain Fee Logic
 
-Only two transfers in `markSettled()`:
+`markSettled()` does one transfer and one pool update:
 
 ```
-1. token.transfer(fillingLP, amount - 0.2%)    -> LP gets paid
-2. token.transfer(protocolLP, 0.2%)            -> protocol LP compounds
+1. poolAssets += (amount - 0.2%)               -> LP pool earns (share price rises)
+2. token.transfer(protocolFeeRecipient, 0.2%)  -> protocol fee sent externally
 ```
 
-The 0.1% LP fee is never explicitly calculated -- it's the natural spread between what the LP gave (netAmount after 0.3%) and what they received (amount minus 0.2%). Clean, minimal, no fee manager contract. The Peer spread is entirely external and never touches OWN contracts.
+The 0.1% LP fee is never explicitly calculated — it's the natural spread between what the pool gave out (netAmount after 0.3%) and what flows back (amount minus 0.2%). All pool depositors benefit proportionally via share price appreciation. The Peer spread is entirely external and never touches OWN contracts.
 
 ### Protocol Fee (0.2%) Usage
 
@@ -1107,18 +998,19 @@ Users trust:
     holds user's approved token briefly during off-ramp swap)
 
 LPs trust:
-  - OwnBridge contracts (only release from allowance on valid Hyperlane message)
+  - OwnBridge contracts (pool custodies deposited funds, releases only on valid Hyperlane message)
   - Hyperlane validators (won't forge messages)
-  - Service operator (calls markSettled to pay LP — if operator disappears,
-    LP gave tokens but doesn't get paid. Mitigated by LP revoking allowance.)
+  - Service operator (calls markSettled to feed LP payment back to pool — if operator
+    disappears, pool is depleted by fills but never replenished. LP can withdraw remaining.)
 
 Service operator can:
-  - Call markSettled() to distribute locked funds to LP + protocol
+  - Call markSettled() to distribute locked funds to pool + protocol
   - Receive eUSDC via handle() and swap to user's desired token (on-ramp)
   - Swap user's approved token to eUSDC and bridge (off-ramp)
   - Cannot call markSettled() on already-settled or refunded deposits
-  - Cannot drain LP beyond their allowance (handle() only fires on valid messages)
+  - Cannot drain pool beyond valid Hyperlane messages (handle() only fires on valid messages)
   - Cannot prevent user refunds after 2hr timeout (user calls directly)
+  - Cannot prevent LP withdrawals (withdrawLP() has no pause guard)
 
 Swap executor risk:
   - eUSDC sits in swap executor wallet briefly (~seconds) between handle() and swap
@@ -1156,10 +1048,10 @@ Nobody loses funds. Worst case is a 2-hour wait for refund.
 
 ### LP Protection
 
-- LPs approve only OwnBridge contract, not an EOA
-- OwnBridge only pulls from allowance when a valid Hyperlane message arrives
+- LP funds are in the pool — only released on valid Hyperlane messages
 - Messages are verified: correct origin chain, correct sender contract
-- LP can revoke allowance at any time to stop fills
+- LP can withdraw from pool at any time (no pause guard on withdrawals)
+- Pool balance is authoritative — no stale allowance state, no race conditions
 
 ### Hyperlane Trust
 
@@ -1193,8 +1085,8 @@ src/
       gas.ts               -- Service gas wallet management (PLS for PulseChain gas)
 
   lp/
-    manager.ts             -- LP registration, allowance tracking
-    rebalancer.ts          -- Track LP inventory across chains
+    monitor.ts             -- Pool balance monitoring across chains
+    rebalancer.ts          -- Track pool balance across chains, alert if low
 
   chain/
     clients.ts             -- Viem clients for Base + PulseChain
@@ -1261,16 +1153,13 @@ CREATE TABLE intents (
 );
 
 -- LP registry
-CREATE TABLE lps (
-  address TEXT,
+CREATE TABLE pool_state (
   chain TEXT,
-  token TEXT,
-  active INTEGER,
-  allowance TEXT,
-  total_fills INTEGER,
-  total_volume TEXT,
-  total_earned TEXT,
-  created_at INTEGER,
+  pool_assets TEXT,
+  total_shares TEXT,
+  share_price TEXT,
+  last_updated INTEGER,
+);
   PRIMARY KEY (address, chain, token)
 );
 
@@ -1572,4 +1461,4 @@ Add BSC <-> PulseChain, Arbitrum <-> PulseChain corridors. Same OwnBridge contra
 
 ### Smart Contract Risk
 - **Risk:** Bug in OwnBridge allows unauthorized release
-- **Mitigation:** Minimal contract surface. Thorough testing. LP allowance limits exposure. Refund timeout limits lockup duration.
+- **Mitigation:** Minimal contract surface. Thorough testing (64 tests + fuzz suites). Pool model means contract holds LP funds — exposure is total pool size. Refund timeout limits user lockup duration. LP can withdraw anytime.
