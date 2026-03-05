@@ -72,11 +72,12 @@ SYSTEM_PROMPT = _build_system_prompt()
 TOOLS = [
     {
         "name": "Bash",
-        "description": "Execute a shell command and return stdout/stderr.",
+        "description": "Execute a shell command and return stdout/stderr. Use background=true for long-running processes like dev servers (vite, npm start, etc.) — the process will keep running and you can continue editing files for hot reload.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "The shell command to execute"},
+                "background": {"type": "boolean", "description": "Run in background (for dev servers). Returns immediately.", "default": False},
             },
             "required": ["command"],
         },
@@ -176,23 +177,61 @@ def _describe_tool(name: str, inp: dict) -> str:
     return fn(inp) if fn else f"Using {name}"
 
 
+_bg_procs: list[subprocess.Popen] = []
+_CREATE_NEW_PROCESS_GROUP = 0x00000200
+_CREATE_NO_WINDOW = 0x08000000
+
+
+def _run_bash_sync(cmd: str) -> str:
+    """Run a bash command with proper process-tree cleanup on Windows."""
+    proc = subprocess.Popen(
+        ["bash", "-c", cmd],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL, text=True,
+        cwd=str(WORKSPACE),
+        creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            capture_output=True, creationflags=_CREATE_NO_WINDOW,
+        )
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return "Command timed out after 120s"
+    out = stdout
+    if stderr:
+        out += ("\n" if out else "") + stderr
+    if proc.returncode != 0:
+        out += f"\n(exit code {proc.returncode})"
+    return (out[:50000] if out else "(no output)").strip()
+
+
+def _run_bash_background(cmd: str) -> str:
+    """Start a background process (dev servers etc). Returns immediately."""
+    proc = subprocess.Popen(
+        ["bash", "-c", cmd],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        cwd=str(WORKSPACE),
+        creationflags=_CREATE_NEW_PROCESS_GROUP | _CREATE_NO_WINDOW,
+    )
+    _bg_procs.append(proc)
+    log.info("Background process started: PID %d", proc.pid)
+    return f"Background process started (PID {proc.pid}). It will keep running."
+
+
 async def _tool_bash(inp: dict) -> str:
     cmd = inp["command"]
+    background = inp.get("background", False)
     try:
-        result = await asyncio.to_thread(
-            subprocess.run,
-            ["bash", "-c", cmd],
-            capture_output=True, text=True, timeout=120,
-            cwd=str(WORKSPACE), stdin=subprocess.DEVNULL,
-        )
-        out = result.stdout
-        if result.stderr:
-            out += ("\n" if out else "") + result.stderr
-        if result.returncode != 0:
-            out += f"\n(exit code {result.returncode})"
-        return (out[:50000] if out else "(no output)").strip()
-    except subprocess.TimeoutExpired:
-        return "Command timed out after 120s"
+        if background:
+            return await asyncio.to_thread(_run_bash_background, cmd)
+        return await asyncio.to_thread(_run_bash_sync, cmd)
     except Exception as e:
         return f"Error: {e}"
 
@@ -397,6 +436,57 @@ def _sanitize_history(history: list[dict]) -> list[dict]:
         break
     return history
 
+MAX_TOKEN_EST = 150000  # leave headroom below 200k limit
+
+def _estimate_tokens(history: list[dict]) -> int:
+    """Rough token estimate: ~4 chars per token."""
+    total = 0
+    for msg in history:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            total += len(content)
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    if block.get("type") == "text":
+                        total += len(block.get("text", ""))
+                    elif block.get("type") == "tool_use":
+                        total += len(json.dumps(block.get("input", {})))
+                    elif block.get("type") == "tool_result":
+                        c = block.get("content", "")
+                        total += len(c) if isinstance(c, str) else len(json.dumps(c))
+    return total // 4
+
+
+def _trim_history(history: list[dict]) -> list[dict]:
+    """Trim history by message count and token estimate, then fix orphans."""
+    max_msgs = MAX_HISTORY * 2
+    if len(history) > max_msgs:
+        history = history[-max_msgs:]
+
+    # Trim by estimated tokens — drop oldest pairs until under limit
+    while len(history) > 2 and _estimate_tokens(history) > MAX_TOKEN_EST:
+        history = history[2:]  # drop in pairs to keep user/assistant alignment
+
+    # Fix trailing orphans
+    history = _sanitize_history(history)
+
+    # Fix leading orphans: must start with a clean user text message
+    while history:
+        first = history[0]
+        if first.get("role") == "user" and isinstance(first.get("content"), list):
+            if any(isinstance(b, dict) and b.get("type") == "tool_result"
+                   for b in first["content"]):
+                history.pop(0)
+                continue
+        if first.get("role") == "assistant":
+            history.pop(0)
+            continue
+        break
+
+    return history
+
+
 def _save_history(history: list[dict]):
     MAX_SAVE = 2000
     cleaned = []
@@ -482,12 +572,7 @@ async def stream_claude(content_blocks: list, status_msg) -> tuple[str, list[str
 
     conversation_history.append({"role": "user", "content": content_blocks})
 
-    max_msgs = MAX_HISTORY * 2
-    if len(conversation_history) > max_msgs:
-        conversation_history = conversation_history[-max_msgs:]
-
-    # Fix any orphaned tool_use from a previous crash
-    conversation_history = _sanitize_history(conversation_history)
+    conversation_history = _trim_history(conversation_history)
 
     written_files = []
     tool_log = []
